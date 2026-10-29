@@ -9,6 +9,7 @@ import { readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
+import { getHeapStatistics } from 'node:v8'
 import { createRelay } from './relay'
 import { createAuthStore } from './auth'
 import { createCharacterStore } from './characters'
@@ -44,7 +45,7 @@ if (process.env.TLS_KEY && process.env.TLS_CERT) {
   try {
     tls = { key: readFileSync(process.env.TLS_KEY, 'utf8'), cert: readFileSync(process.env.TLS_CERT, 'utf8') }
   } catch (e) {
-    console.error('[tls] 인증서/키 로드 실패 — 평문으로 시작하지 않고 종료합니다:', e)
+    console.error('[tls] 인증서/키 로드 실패. 평문으로 시작하지 않고 종료합니다:', e)
     process.exit(1)
   }
 }
@@ -102,6 +103,7 @@ function checkSourceSet(): string[] {
   if (!existsSync(listPath)) return []
   try {
     const want = JSON.parse(readFileSync(listPath, 'utf8')) as Record<string, string>
+    const hex = (b: Buffer): string => createHash('sha256').update(b).digest('hex')
     const odd: string[] = []
     for (const [name, hash] of Object.entries(want)) {
       const p = join(srcDir, name)
@@ -109,7 +111,12 @@ function checkSourceSet(): string[] {
         odd.push(`${name} (없음)`)
         continue
       }
-      if (createHash('sha256').update(readFileSync(p)).digest('hex') !== hash) odd.push(`${name} (다른 판)`)
+      const raw = readFileSync(p)
+      if (hex(raw) === hash) continue
+      // 줄끝(CRLF/LF)만 다른 사본은 같은 판이다 — 깃 설정(text=auto 등)이 커밋하며 줄끝을 바꿔도
+      // 멀쩡한 배포를 어긋남으로 몰지 않게, CR 을 걷어낸 바이트로 한 번 더 맞춰 본다(대조표는 LF 기준).
+      if (hex(Buffer.from(raw.toString('utf8').replace(/\r/g, ''), 'utf8')) === hash) continue
+      odd.push(`${name} (다른 판)`)
     }
     return odd
   } catch {
@@ -158,11 +165,13 @@ const communityEcon = createCommunityEcon({
   gifts: communityGifts
 })
 
-const { httpServer } = createRelay({
+const { httpServer, listAvatarRefs } = createRelay({
   requireAuth: true,
   // ⚠ 릴레이도 같은 폴더를 봐야 한다 — 관리 화면의 서버 데이터 내보내기/가져오기가 이 값으로 폴더를 훑는다.
   //   여기만 빠지면 볼륨을 다른 곳에 붙인 서버에서 '빈 백업'이 성공한 것처럼 내려간다.
   dataDir,
+  // /health 의 data 필드('fresh'/'used') — 볼륨이 안 붙어 매 배포 새 폴더로 시작하는 서버를 밖에서 알아보게.
+  dataFresh: dataState.fresh,
   auth: authStore,
   characters: charStore,
   rooms: roomStore,
@@ -228,6 +237,7 @@ function runAssetGc(): void {
     communityCatalog.collectAssetRefs(live) // ⚠아이템 그림·상점 배너
     communityGifts.collectAssetRefs(live) // ⚠보내는 중인 선물의 편지 그림
     communityGames.collectAssetRefs(live) // ⚠퀘스트 배너·완료 카드·장면 그림
+    listAvatarRefs(live) // ⚠DM 목록이 옮겨 놓은 프사 — 계정 파일에는 원본이 남아 참조가 안 잡힌다
     const { removed, freed, deferred, failed } = assetStore.sweep(live)
     if (removed || failed) {
       console.log(
@@ -254,7 +264,7 @@ let shuttingDown = false
 function shutdown(signal: string): void {
   if (shuttingDown) return
   shuttingDown = true
-  console.log(`[server] ${signal} — 저장하고 종료합니다.`)
+  console.log(`[server] ${signal} 신호를 받았습니다. 저장하고 종료합니다.`)
   // 새 일감을 먼저 끊는다 — 주기 저장이 한 번 더 끼어들거나 새 접속이 들어오면 마무리가 끝나지 않는다.
   clearInterval(save)
   try {
@@ -300,10 +310,10 @@ process.on('SIGINT', () => shutdown('SIGINT'))
  * 종료 중에는 원래 하던 마무리를 방해하지 않는다.
  */
 process.on('unhandledRejection', (reason) => {
-  console.error('[server] 처리되지 않은 거부 — 서버는 계속 돌립니다:', reason)
+  console.error('[server] 처리되지 않은 거부. 서버는 계속 돌립니다:', reason)
 })
 process.on('uncaughtException', (err) => {
-  console.error('[server] 처리되지 않은 예외 — 서버는 계속 돌립니다:', err)
+  console.error('[server] 처리되지 않은 예외. 서버는 계속 돌립니다:', err)
 })
 
 /**
@@ -328,6 +338,44 @@ httpServer.on('error', (err: NodeJS.ErrnoException) => {
   process.exit(1)
 })
 
+/**
+ * 메모리 천장 두 개를 켤 때 적어 둔다 — 이 서버가 쓸 수 있는 한도와, V8 이 스스로 잡은 힙 천장.
+ *
+ * 메모리로 죽는 것은 예외가 아니라서 어떤 그물로도 못 받는다. 프로세스가 그냥 사라지고 그 순간 접속해
+ * 있던 사람이 전부 함께 튕긴다. 그런데 V8 은 컨테이너에 걸린 한도를 모르고 기계 전체를 기준으로 천장을
+ * 잡기 때문에, 한도보다 높은 천장을 들고 있으면 정리할 때가 됐는데도 미루다 그대로 끝난다.
+ * 두 수를 나란히 남겨 두면 그 어긋남이 눈에 보이고, 호스팅의 환경변수 하나로 맞출 수 있다.
+ */
+function reportMemoryCeiling(): void {
+  const heapCapMB = Math.round(getHeapStatistics().heap_size_limit / 1048576)
+  // 컨테이너 한도(cgroup v2 → v1 순). 한도가 없으면 'max' 이거나 파일이 없다.
+  let limitMB = 0
+  for (const p of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+    try {
+      const n = Number(readFileSync(p, 'utf8').trim())
+      if (Number.isFinite(n) && n > 0 && n < 64 * 1024 ** 3) {
+        limitMB = Math.round(n / 1048576)
+        break
+      }
+    } catch {
+      /* 이 기계엔 없는 파일 — 다음 후보로 */
+    }
+  }
+  if (!limitMB) {
+    console.log(`[server] 메모리: 힙 천장 ${heapCapMB}MB (호스팅 한도 없음/미확인)`)
+    return
+  }
+  console.log(`[server] 메모리: 호스팅 한도 ${limitMB}MB · 힙 천장 ${heapCapMB}MB`)
+  if (heapCapMB > limitMB * 0.85) {
+    console.warn(
+      `[server] ⚠ 힙 천장(${heapCapMB}MB)이 호스팅 한도(${limitMB}MB)에 비해 높습니다. 메모리가 차면 서버가\n` +
+        `[server] ⚠ 예고 없이 내려가고 접속해 있던 사람이 전부 끊깁니다. 환경변수에\n` +
+        `[server] ⚠   NODE_OPTIONS=--max-old-space-size=${Math.floor((limitMB * 3) / 4)}\n` +
+        '[server] ⚠ 을 넣어 주세요.'
+    )
+  }
+}
+
 httpServer.listen(PORT, () => {
   const scheme = tls ? 'wss' : 'ws'
   const cors = corsOrigins ? corsOrigins.join(', ') : '*'
@@ -336,6 +384,7 @@ httpServer.listen(PORT, () => {
     `타코야키 박스 릴레이 서버 listening on :${PORT} (${scheme} · CORS: ${cors} · ${web} · health: GET /health, Ctrl+C 종료)`
   )
   console.log(`[data] 영속 폴더: ${dataDir}`)
+  reportMemoryCeiling()
   // 볼륨을 안 붙였거나 마운트 경로를 잘못 적으면 여기가 매 배포마다 새 폴더가 된다 — 조용히 지나가지 않는다.
   if (dataState.fresh) {
     console.warn(
@@ -347,7 +396,7 @@ httpServer.listen(PORT, () => {
   const oddFiles = checkSourceSet()
   if (oddFiles.length) {
     console.warn(
-      `[server] ⚠ 서버 파일 ${oddFiles.length}개가 다른 판입니다: ${oddFiles.slice(0, 8).join(', ')}${oddFiles.length > 8 ? ' …' : ''}\n` +
+      `[server] ⚠ 서버 파일 ${oddFiles.length}개가 다른 판입니다: ${oddFiles.join(', ')}\n` +
         '[server] ⚠ 새 판의 src 폴더를 통째로 덮어써 주세요. 일부만 바꾸면 기능을 쓰는 순간 서버가 멈출 수 있습니다.'
     )
   }
